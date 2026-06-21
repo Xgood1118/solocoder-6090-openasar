@@ -58,7 +58,24 @@ exports.init = (endpoint, { releaseChannel, version }) => {
 
   resetTracking();
 
-  Module.globalPaths.push(basePath);
+  const disabledMods = new Set((global.oaConfig || {}).disabledModules || []);
+  if (disabledMods.size === 0) {
+    Module.globalPaths.push(basePath);
+  } else {
+    try {
+      const fs = require('fs');
+      for (const m of fs.readdirSync(basePath)) {
+        const cleanName = m.replace(/-\d[\d.]*$/, '');
+        if (disabledMods.has(m) || disabledMods.has(cleanName)) {
+          log('Modules', 'Skipping disabled module:', m);
+          continue;
+        }
+        Module.globalPaths.push(join(basePath, m));
+      }
+    } catch {
+      Module.globalPaths.push(basePath);
+    }
+  }
 
   // Purge pending
   fs.rmSync(downloadPath, { recursive: true, force: true });

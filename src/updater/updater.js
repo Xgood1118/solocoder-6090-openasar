@@ -198,8 +198,14 @@ class Updater extends require('events').EventEmitter {
 
   _commitModulesInner(versions) {
     const base = join(this._getHostPath(), 'modules');
+    const disabledMods = new Set((global.oaConfig || {}).disabledModules || []);
 
     for (const m in versions.current_modules) {
+      if (disabledMods.has(m)) {
+        log('Updater', 'Skipping disabled module:', m);
+        this.committedModules.add(m);
+        continue;
+      }
       const path = join(base, `${m}-${versions.current_modules[m]}`);
       if (this.committedModules.has(m) || Module.globalPaths.includes(path)) continue;
 

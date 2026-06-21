@@ -21,9 +21,17 @@ require('./cmdSwitches')();
 // Force u2QuickLoad (pre-"minified" ish)
 const M = require('module'); // Module
 
+const disabledMods = new Set(oaConfig.disabledModules || []);
 const b = join(paths.getExeDir(), 'modules'); // Base dir
 if (process.platform === 'win32') try {
-  for (const m of require('fs').readdirSync(b)) M.globalPaths.unshift(join(b, m)); // For each module dir, add to globalPaths
+  for (const m of require('fs').readdirSync(b)) {
+    const cleanName = m.replace(/-\d[\d.]*$/, '');
+    if (disabledMods.has(m) || disabledMods.has(cleanName)) {
+      log('Init', 'Skipping disabled module:', m);
+      continue;
+    }
+    M.globalPaths.unshift(join(b, m)); // For each module dir, add to globalPaths
+  }
 } catch { log('Init', 'Failed to QS globalPaths') }
 
 // inject Module.globalPaths into resolve lookups as it was removed in Electron >=17 and Discord depend on this workaround

@@ -40,10 +40,22 @@ const startCore = () => {
 
       const [ channel = '', hash = '' ] = oaVersion.split('-'); // Split via -
 
+      const tc = oaConfig.trackControl || {};
+      const legacyNoTrack = oaConfig.noTrack !== false;
+      const tcStr = JSON.stringify({
+        blockScience: tc.blockScience !== undefined ? tc.blockScience : legacyNoTrack,
+        blockMetrics: tc.blockMetrics !== undefined ? tc.blockMetrics : legacyNoTrack,
+        blockTyping: tc.blockTyping !== undefined ? tc.blockTyping : (oaConfig.noTyping === true),
+        blockCrash: tc.blockCrash !== undefined ? tc.blockCrash : legacyNoTrack,
+        blockOther: tc.blockOther !== undefined ? tc.blockOther : legacyNoTrack
+      });
+
       bw.webContents.executeJavaScript(readFileSync(join(__dirname, 'mainWindow.js'), 'utf8')
         .replaceAll('<hash>', hash).replaceAll('<channel>', channel === 'nightly' ? '' : channel)
         .replaceAll('<notrack>', oaConfig.noTrack !== false)
         .replaceAll('<domopt>', oaConfig.domOptimizer !== false)
+        .replaceAll('<trackcontrol>', tcStr)
+        .replaceAll('<chatlazyload>', (oaConfig.chatLazyLoad !== false).toString())
         .replace('<css>', (oaConfig.css ?? '').replaceAll('\\', '\\\\').replaceAll('`', '\\`')));
 
       if (oaConfig.js) bw.webContents.executeJavaScript(oaConfig.js);
@@ -99,13 +111,44 @@ const startCore = () => {
 };
 
 const startUpdate = () => {
+  const tc = oaConfig.trackControl || {};
+  const legacyNoTrack = oaConfig.noTrack !== false;
+
+  const blockScience = tc.blockScience !== undefined ? tc.blockScience : legacyNoTrack;
+  const blockMetrics = tc.blockMetrics !== undefined ? tc.blockMetrics : legacyNoTrack;
+  const blockTyping = tc.blockTyping !== undefined ? tc.blockTyping : (oaConfig.noTyping === true);
+  const blockCrash = tc.blockCrash !== undefined ? tc.blockCrash : legacyNoTrack;
+  const blockOther = tc.blockOther !== undefined ? tc.blockOther : legacyNoTrack;
+
+  global.oaTrackControl = { blockScience, blockMetrics, blockTyping, blockCrash, blockOther };
+
   const urls = [
-    oaConfig.noTrack !== false ? 'https://*/api/*/science' : '',
-    oaConfig.noTrack !== false ? 'https://*/api/*/metrics' : '',
-    oaConfig.noTyping === true ? 'https://*/api/*/typing' : ''
+    blockScience ? 'https://*/api/*/science' : '',
+    blockMetrics ? 'https://*/api/*/metrics' : '',
+    blockTyping ? 'https://*/api/*/typing' : '',
+    blockOther ? 'https://*/api/*/track' : '',
+    blockCrash ? 'https://sentry.io/*' : '',
+    blockCrash ? 'https://*.sentry.io/*' : ''
   ].filter(x => x);
 
-  if (urls.length > 0) session.defaultSession.webRequest.onBeforeRequest({ urls }, (e, cb) => cb({ cancel: true }));
+  if (urls.length > 0) {
+    session.defaultSession.webRequest.onBeforeRequest({ urls }, (e, cb) => {
+      const url = e.url;
+      let blocked = false;
+      let category = '';
+      if (blockScience && url.indexOf('/science') !== -1) { blocked = true; category = 'science'; }
+      else if (blockMetrics && url.indexOf('/metrics') !== -1) { blocked = true; category = 'metrics'; }
+      else if (blockTyping && url.indexOf('/typing') !== -1) { blocked = true; category = 'typing'; }
+      else if (blockOther && url.indexOf('/track') !== -1) { blocked = true; category = 'track'; }
+      else if (blockCrash && (url.indexOf('sentry.io') !== -1)) { blocked = true; category = 'crash'; }
+      if (blocked) {
+        log('TrackBlock', category.toUpperCase(), url.substring(0, 80));
+        cb({ cancel: true });
+      } else {
+        cb({});
+      }
+    });
+  }
 
   const startMin = process.argv?.includes?.('--start-minimized');
   if (Constants.USE_NEW_UPDATER && updater.tryInitUpdater(buildInfo, Constants.NEW_UPDATE_ENDPOINT, Constants.USE_RUST_BSPATCH)) {

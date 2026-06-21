@@ -5,8 +5,57 @@ const updater = require("../updater/updater");
 
 let launched, win;
 
+let lastProgressTime = 0;
+let skipTimer = null;
+let skipInjected = false;
+
+const SKIP_TIMEOUT_MS = 15000;
+
+const updateProgressTime = () => {
+  lastProgressTime = Date.now();
+  armSkipTimer();
+};
+
+const armSkipTimer = () => {
+  if (skipTimer) clearTimeout(skipTimer);
+  skipInjected = false;
+  skipTimer = setTimeout(() => {
+    if (launched) return;
+    injectSkipButton();
+  }, SKIP_TIMEOUT_MS);
+};
+
+const injectSkipButton = () => {
+  if (skipInjected || !win || win.isDestroyed()) return;
+  skipInjected = true;
+  try {
+    win.webContents.executeJavaScript(`
+      (function() {
+        if (document.getElementById('openasar-skip-btn')) return;
+        var btn = document.createElement('button');
+        btn.id = 'openasar-skip-btn';
+        btn.textContent = '跳过更新直接启动';
+        btn.style.cssText = 'position:fixed;bottom:20px;left:50%;transform:translateX(-50%);padding:10px 24px;background:#5865F2;color:#fff;border:none;border-radius:5px;cursor:pointer;font-size:13px;font-weight:600;box-shadow:0 2px 8px rgba(0,0,0,0.3);z-index:9999;transition:background 0.15s;';
+        btn.onmouseover = function() { this.style.background = '#4752C4'; };
+        btn.onmouseout = function() { this.style.background = '#5865F2'; };
+        btn.onclick = function() {
+          try { Splash.manualSkip(); } catch(e) { try { ipcRenderer.send('sm'); } catch(e2){} }
+        };
+        var tip = document.createElement('div');
+        tip.id = 'openasar-skip-tip';
+        tip.style.cssText = 'position:fixed;bottom:58px;left:50%;transform:translateX(-50%);color:#b9bbbe;font-size:11px;text-align:center;width:100%;padding:0 16px;z-index:9998;';
+        tip.textContent = '更新已超过 15 秒无响应，可跳过更新立即启动';
+        document.body.appendChild(tip);
+        document.body.appendChild(btn);
+      })();
+    `);
+  } catch (e) { log('Splash', 'Inject skip button failed', e); }
+};
 
 exports.initSplash = (startMin) => {
+  lastProgressTime = Date.now();
+  armSkipTimer();
+
   const inst = updater.getUpdater();
   if (inst) initNew(inst);
     else initOld();
@@ -15,6 +64,7 @@ exports.initSplash = (startMin) => {
 
 
   if (process.env.OPENASAR_QUICKSTART || oaConfig.quickstart) setTimeout(() => {
+    if (skipTimer) clearTimeout(skipTimer);
     destroySplash();
 
     launchMain();
@@ -29,6 +79,7 @@ exports.focusWindow = () => win?.focus?.();
 exports.pageReady = () => destroySplash() || process.nextTick(() => events.emit('APP_SHOULD_SHOW'));
 
 const destroySplash = () => {
+  if (skipTimer) { clearTimeout(skipTimer); skipTimer = null; }
   win?.setSkipTaskbar?.(true);
 
   setTimeout(() => {
@@ -41,9 +92,10 @@ const destroySplash = () => {
 };
 
 const launchMain = () => {
+  if (skipTimer) { clearTimeout(skipTimer); skipTimer = null; }
   moduleUpdater.events.removeAllListeners(); // Remove updater v1 listeners
 
-  if (!launched && win != null) {
+  if (!launched) {
     sendState('starting');
 
     launched = true;
@@ -68,6 +120,14 @@ const launchSplash = (startMin) => {
 
   ipcMain.on('ss', launchMain);
   ipcMain.on('sq', app.quit);
+  ipcMain.on('sm', () => {
+    log('Splash', 'User manually skipped update');
+    launchMain();
+  });
+
+  win.webContents.once('dom-ready', () => {
+    if (!launched) updateProgressTime();
+  });
 
   if (!startMin) win.once('ready-to-show', win.show);
 };
@@ -97,6 +157,7 @@ class UIProgress { // Generic class to track updating and sent states to splash
     if (current) this.progress.set(id, [ current, outOf ?? 100 ]);
     if (state === 'Complete') this.done.add(id);
 
+    updateProgressTime();
     this.send();
   }
 
@@ -104,6 +165,7 @@ class UIProgress { // Generic class to track updating and sent states to splash
     if ((toSend === -1 && this.progress.size > 0 && this.progress.size > this.done.size) || toSend === this.st) {
       const progress = Math.min(100, [...this.progress.values()].reduce((a, x) => a + x[0], 0) / [...this.progress.values()].reduce((a, x) => a + x[1], 0) * 100); // Clamp progress to 0-100
 
+      updateProgressTime();
       sendState(this.st ? 'installing' : 'downloading', {
         current: this.done.size + 1,
         total: this.total.size,
@@ -126,6 +188,7 @@ const initNew = async (inst) => {
   };
 
   while (true) {
+    updateProgressTime();
     sendState('checking-for-updates');
 
     try {
@@ -182,6 +245,7 @@ const initOld = () => { // "Old" (not v2 / new, win32 only)
   };
 
   on('checked', ({ failed, count }) => { // Finished check
+    updateProgressTime();
     installs.reset();
     downloads.reset();
 
@@ -190,6 +254,7 @@ const initOld = () => { // "Old" (not v2 / new, win32 only)
   });
 
   on('downloaded', ({ failed }) => { // Downloaded all modules
+    updateProgressTime();
     toSend = 1;
 
     if (failed > 0) handleFail();
@@ -213,15 +278,23 @@ const initOld = () => { // "Old" (not v2 / new, win32 only)
   on('downloaded-module', segment(downloads));
   on('installed-module', segment(installs));
 
-  on('manual', (e) => sendState('manual', { details: e })); // Host manual update required
+  on('manual', (e) => { updateProgressTime(); sendState('manual', { details: e }); }); // Host manual update required
 
+  updateProgressTime();
   sendState('checking-for-updates');
 
   check();
 };
 
 const fail = (c) => {
+  injectSkipButton();
   sendState('fail', { seconds: 10 });
 
-  setTimeout(c, 10000);
+  const fallbackTimer = setTimeout(c, 10000);
+  const checkInterval = setInterval(() => {
+    if (launched) {
+      clearTimeout(fallbackTimer);
+      clearInterval(checkInterval);
+    }
+  }, 100);
 };
