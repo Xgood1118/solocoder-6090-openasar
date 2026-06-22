@@ -1,6 +1,6 @@
 const { ipcMain, app, shell } = require('electron');
 const fs = require('fs');
-const { join } = require('path');
+const { join, resolve, basename, sep } = require('path');
 
 ipcMain.on('DISCORD_UPDATED_QUOTES', (e, c) => {
   if (c === 'o') exports.open();
@@ -9,6 +9,53 @@ ipcMain.on('DISCORD_UPDATED_QUOTES', (e, c) => {
 const restart = () => {
   app.relaunch();
   app.exit(0);
+};
+
+const MODULE_NAME_REGEX = /^[a-zA-Z0-9_-]{1,100}$/;
+
+const isModuleNameSafe = (name) => {
+  if (typeof name !== 'string') return false;
+  if (!MODULE_NAME_REGEX.test(name)) return false;
+  if (name.includes('..')) return false;
+  if (name.includes(sep)) return false;
+  if (name.includes('/')) return false;
+  if (name.includes('\\')) return false;
+  if (name.includes('\0')) return false;
+  return true;
+};
+
+const isPathInsideBase = (targetPath, basePath) => {
+  try {
+    const normalizedTarget = resolve(targetPath);
+    const normalizedBase = resolve(basePath) + sep;
+    if (!normalizedTarget.startsWith(normalizedBase)) return false;
+    const relativePart = normalizedTarget.slice(normalizedBase.length);
+    if (relativePart.includes('..' + sep) || relativePart.includes(sep + '..')) return false;
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const getValidModuleNames = () => {
+  const names = new Set();
+  try {
+    const moduleUpdater = require('../updater/moduleUpdater');
+    const installed = moduleUpdater.getInstalled();
+    for (const name in installed) {
+      if (isModuleNameSafe(name)) names.add(name);
+    }
+  } catch {}
+  try {
+    const Module = require('module');
+    for (const p of Module.globalPaths) {
+      const baseName = p.split(/[\\/]/).pop();
+      const cleanName = baseName.replace(/-\d[\d.]*$/, '');
+      if (isModuleNameSafe(cleanName)) names.add(cleanName);
+      if (isModuleNameSafe(baseName)) names.add(baseName);
+    }
+  } catch {}
+  return names;
 };
 
 const calcDirSize = (dir) => {
@@ -52,7 +99,12 @@ const enumerateModules = () => {
   try {
     const moduleUpdater = require('../updater/moduleUpdater');
     const installed = moduleUpdater.getInstalled();
-    for (const name in installed) {
+    for (const rawName in installed) {
+      if (!isModuleNameSafe(rawName)) {
+        log('Config', 'Skipping unsafe module name in enumeration:', rawName);
+        continue;
+      }
+      const name = rawName;
       let size = 0;
       let modulePath = null;
       if (base) {
@@ -61,7 +113,10 @@ const enumerateModules = () => {
           join(base, name + '-' + (installed[name].installedVersion || '')),
           join(base, name + '-' + (installed[name].installedVersion || ''), name)
         ];
-        for (const p of tryPaths) {
+        for (const rawP of tryPaths) {
+          if (!isPathInsideBase(rawP, base)) continue;
+          const p = resolve(rawP);
+          if (!isPathInsideBase(p, base)) continue;
           if (fs.existsSync(p)) {
             modulePath = p;
             size = calcDirSize(p);
@@ -87,19 +142,29 @@ const enumerateModules = () => {
   for (const p of Module.globalPaths) {
     const baseName = p.split(/[\\/]/).pop();
     const cleanName = baseName.replace(/-\d[\d.]*$/, '');
-    if (seen.has(cleanName) || seen.has(baseName)) continue;
+    const safeName = isModuleNameSafe(cleanName) ? cleanName : (isModuleNameSafe(baseName) ? baseName : null);
+    if (!safeName) continue;
+    if (seen.has(safeName)) continue;
+
     let size = 0;
-    try { size = calcDirSize(p); } catch {}
+    try {
+      if (base && isPathInsideBase(p, base)) {
+        size = calcDirSize(resolve(p));
+      } else if (base) {
+        continue;
+      } else {
+        size = calcDirSize(p);
+      }
+    } catch {}
     modules.push({
-      name: cleanName || baseName,
+      name: safeName,
       version: 'detected',
       size,
       sizeStr: fmtSize(size),
-      disabled: disabledSet.has(cleanName) || disabledSet.has(baseName),
+      disabled: disabledSet.has(safeName),
       path: p
     });
-    seen.add(cleanName);
-    seen.add(baseName);
+    seen.add(safeName);
   }
 
   return modules.sort((a, b) => b.size - a.size);
@@ -457,6 +522,19 @@ exports.open = () => {
   });
 
   ipcMain.on('tm', (e, name) => {
+    if (!isModuleNameSafe(name)) {
+      log('Config', 'Blocked unsafe module name in tm:', name);
+      e.returnValue = false;
+      return;
+    }
+
+    const validNames = getValidModuleNames();
+    if (!validNames.has(name)) {
+      log('Config', 'Blocked unknown module name in tm:', name);
+      e.returnValue = false;
+      return;
+    }
+
     const disabled = new Set(config.disabledModules || []);
     if (disabled.has(name)) {
       disabled.delete(name);
@@ -471,32 +549,69 @@ exports.open = () => {
   });
 
   ipcMain.on('um', (e, name) => {
+    if (!isModuleNameSafe(name)) {
+      log('Config', 'Blocked unsafe module name in um:', name);
+      e.returnValue = false;
+      return;
+    }
+
+    const validNames = getValidModuleNames();
+    if (!validNames.has(name)) {
+      log('Config', 'Blocked unknown module name in um:', name);
+      e.returnValue = false;
+      return;
+    }
+
     let success = false;
     try {
       const base = getModuleBasePath();
+      if (!base) {
+        e.returnValue = false;
+        return;
+      }
+
       const moduleUpdater = require('../updater/moduleUpdater');
       const installed = moduleUpdater.getInstalled();
       const version = installed[name]?.installedVersion;
-      const paths = [
+
+      const candidatePaths = [
         join(base, name),
         join(base, name + '-' + (version || '')),
         join(base, name + '-' + (version || ''), name)
       ];
-      for (const p of paths) {
+
+      for (const rawP of candidatePaths) {
+        if (!isPathInsideBase(rawP, base)) {
+          log('Config', 'Blocked path traversal attempt in um:', rawP);
+          continue;
+        }
+        const p = resolve(rawP);
+        if (!isPathInsideBase(p, base)) {
+          log('Config', 'Blocked path traversal after resolve in um:', p);
+          continue;
+        }
         if (fs.existsSync(p)) {
           try {
             fs.rmSync(p, { recursive: true, force: true });
             success = true;
-          } catch {}
+            log('Config', 'Uninstalled module:', name, 'from:', p);
+          } catch (e3) {
+            log('Config', 'Failed to remove module path', p, e3);
+          }
         }
       }
+
       if (installed[name]) {
         delete installed[name];
         try {
           const manifestPath = join(base, 'installed.json');
-          fs.writeFileSync(manifestPath, JSON.stringify(installed, null, 2));
-          success = true;
-        } catch {}
+          if (isPathInsideBase(manifestPath, base)) {
+            fs.writeFileSync(resolve(manifestPath), JSON.stringify(installed, null, 2));
+            success = true;
+          }
+        } catch (e3) {
+          log('Config', 'Failed to update manifest', e3);
+        }
       }
     } catch (e2) {
       log('Config', 'Uninstall module error', name, e2);

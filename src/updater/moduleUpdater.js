@@ -58,6 +58,16 @@ exports.init = (endpoint, { releaseChannel, version }) => {
 
   resetTracking();
 
+  const MODULE_NAME_REGEX = /^[a-zA-Z0-9_-]{1,100}$/;
+  const isModuleNameSafe = (name) => {
+    if (typeof name !== 'string') return false;
+    if (!MODULE_NAME_REGEX.test(name)) return false;
+    if (name.includes('..')) return false;
+    if (name.includes('/') || name.includes('\\')) return false;
+    if (name.includes('\0')) return false;
+    return true;
+  };
+
   const disabledMods = new Set((global.oaConfig || {}).disabledModules || []);
   if (disabledMods.size === 0) {
     Module.globalPaths.push(basePath);
@@ -65,6 +75,10 @@ exports.init = (endpoint, { releaseChannel, version }) => {
     try {
       const fs = require('fs');
       for (const m of fs.readdirSync(basePath)) {
+        if (!isModuleNameSafe(m)) {
+          log('Modules', 'Skipping unsafe module dir name:', m);
+          continue;
+        }
         const cleanName = m.replace(/-\d[\d.]*$/, '');
         if (disabledMods.has(m) || disabledMods.has(cleanName)) {
           log('Modules', 'Skipping disabled module:', m);
